@@ -5,7 +5,7 @@
  * Version: 1.0.0
  * Author: skuntank.dev
  * Author URI: https://skuntank.dev
- * Plugin URI: https://skuntank.dev
+ * Plugin URI: https://github.com/skuntank-dev/cf-static/
  */
 
 if (!defined('ABSPATH')) exit;
