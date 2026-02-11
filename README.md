@@ -123,9 +123,11 @@ Credentials can be optionally remembered (not recommended on shared servers).
 ## Author
 
 Developed by **skuntank.dev**  
+
 🌐 https://skuntank.dev
 
 📧 skuntank@skuntank.dev
+
 ---
 
 ## License
