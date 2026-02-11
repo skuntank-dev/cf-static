@@ -124,6 +124,7 @@ Credentials can be optionally remembered (not recommended on shared servers).
 
 Developed by **skuntank.dev**  
 🌐 https://skuntank.dev
+
 📧 skuntank@skuntank.dev
 ---
 
