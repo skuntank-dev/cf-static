@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Cloudflare Access-Friendly Static Page Generator
  * Description: Generate a static version of your WordPress site, bypassing Cloudflare Access via service tokens. If wrangler CLI is installed, you can also push to Pages with your API token.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: skuntank.dev
  * Author URI: https://skuntank.dev
  * Plugin URI: https://github.com/skuntank-dev/cf-static/
@@ -33,7 +33,6 @@ private function get_plugin_version() {
     $plugin_data = get_file_data($plugin_file, ['Version' => 'Version']);
     return $plugin_data['Version'] ?? '0.0.0';
 }
-
 
     public function __construct() {
         $this->site_url   = get_site_url();
@@ -106,7 +105,6 @@ private function check_github_version() {
     return ['update' => false];
 }
 
-
     public function admin_page() {
         if (!current_user_can('manage_options')) return;
 
@@ -119,7 +117,7 @@ $cf_partial_auth  = ($cf_id_filled xor $cf_secret_filled);
         $message  = isset($_GET['message']) ? esc_html($_GET['message']) : '';
         $last_zip = get_option('cf_static_last_zip');
         $generate_404_checked = get_option('cf_static_generate_404', false);
-
+        $generate_404_path = get_option('cf_static_generate_404_path', 'example-page');
 
         // --- Plugin JS selection ---
         $active_plugins = get_option('active_plugins', []);
@@ -181,7 +179,6 @@ if ($wrangler_return !== 0) {
     </p>
 <?php endif; ?>
 
-
             <?php if ($message): ?>
                 <div class="notice notice-success"><p><?php echo $message; ?></p></div>
             <?php endif; ?>
@@ -198,23 +195,38 @@ if ($wrangler_return !== 0) {
                         <th>CF-Access Client Secret</th>
                         <td><input type="text" name="client_secret" value="<?php echo esc_attr($tokens['client_secret']); ?>" class="regular-text"></td>
                         <?php $remember_cf = get_option('cf_static_remember_cf', false); ?>
-<p>
-    <label>
-        <input type="checkbox" name="remember_cf" value="1" <?php checked($remember_cf); ?>>
-        Remember CF Access token (not recommended on non-private servers)
-    </label>
-</p>
+                    <p>
+                        <label>
+                            <input type="checkbox" name="remember_cf" value="1" <?php checked($remember_cf); ?>>
+                            Remember CF Access token (not recommended on non-private servers)
+                        </label>
+                    </p>
 
                     </tr>
                     <tr>
                         <th>Options</th>
                         <td>
-    <label>
-        <input type="checkbox" name="generate_404" value="1" <?php checked($generate_404_checked); ?>>
-        Generate 404.html
-    </label>
-</td>
+                            <label>
+                                <input type="checkbox" id="generate_404_checkbox" name="generate_404" value="1" <?php checked($generate_404_checked); ?>>
+                                Generate 404.html
+                            </label>
 
+                            <div id="generate_404_path_wrapper" style="margin-top:8px; <?php echo $generate_404_checked ? '' : 'display:none;'; ?>">
+                                Generate from: <?php echo esc_html(parse_url($this->site_url, PHP_URL_HOST)); ?>/
+                                <input type="text" name="generate_404_path" value="<?php echo esc_attr($generate_404_path); ?>" class="regular-text" placeholder="example-page">
+                            </div>
+
+                            <script>
+                            document.addEventListener('DOMContentLoaded', function() {
+                                const checkbox = document.getElementById('generate_404_checkbox');
+                                const wrapper  = document.getElementById('generate_404_path_wrapper');
+
+                                checkbox.addEventListener('change', function() {
+                                    wrapper.style.display = this.checked ? 'block' : 'none';
+                                });
+                            });
+                            </script>
+                        </td>
                     </tr>
                 </table>
 
@@ -305,11 +317,18 @@ $disable_deploy = ($wrangler_return !== 0 || !$last_zip_exists) ? 'disabled' : '
 
         $client_id     = sanitize_text_field($_POST['client_id']);
         $client_secret = sanitize_text_field($_POST['client_secret']);
-$remember_cf = !empty($_POST['remember_cf']);
-update_option('cf_static_remember_cf', $remember_cf);
+        $remember_cf = !empty($_POST['remember_cf']);
+        update_option('cf_static_remember_cf', $remember_cf);
 
-$generate_404  = !empty($_POST['generate_404']);
-update_option('cf_static_generate_404', $generate_404);
+        $generate_404  = !empty($_POST['generate_404']);
+        update_option('cf_static_generate_404', $generate_404);
+        $generate_404_path = sanitize_text_field($_POST['generate_404_path'] ?? '');
+
+        if (empty($generate_404_path)) {
+            $generate_404_path = 'example-page';
+        }
+
+        update_option('cf_static_generate_404_path', $generate_404_path);
 
         $selected_plugins = !empty($_POST['selected_plugins']) ? array_map('sanitize_text_field', $_POST['selected_plugins']) : [];
 
@@ -324,19 +343,18 @@ if ($remember_cf) {
         $output_dir = $this->plugin_dir . 'static';
         if (!file_exists($output_dir)) mkdir($output_dir, 0755, true);
 
-// Only authenticate with Cloudflare Access if BOTH fields are provided
-if (!empty($client_id) && !empty($client_secret)) {
-    $this->cf_cookie = $this->authenticate_cf($client_id, $client_secret);
-    if (!$this->cf_cookie) {
-        $this->log[] = 'Cloudflare authentication failed';
-        $this->display_log_and_exit();
-    }
-} else {
-    // No CF Access credentials provided — proceed without authentication
-    $this->cf_cookie = '';
-    $this->log[] = 'CF Access credentials not provided. Skipping Cloudflare authentication.';
-}
-
+        // Only authenticate with Cloudflare Access if BOTH fields are provided
+        if (!empty($client_id) && !empty($client_secret)) {
+            $this->cf_cookie = $this->authenticate_cf($client_id, $client_secret);
+            if (!$this->cf_cookie) {
+                $this->log[] = 'Cloudflare authentication failed';
+                $this->display_log_and_exit();
+            }
+        } else {
+            // No CF Access credentials provided — proceed without authentication
+            $this->cf_cookie = '';
+            $this->log[] = 'CF Access credentials not provided. Skipping Cloudflare authentication.';
+        }
 
         $urls_to_crawl = ['/'];
         $crawled = [];
@@ -378,7 +396,9 @@ if (!empty($client_id) && !empty($client_secret)) {
 
         $this->copy_core_and_plugin_js($output_dir, $selected_plugins);
 
-        if ($generate_404) $this->generate_404($output_dir);
+        if ($generate_404) {
+            $this->generate_404($output_dir, $generate_404_path);
+        }
 
         // Remove old ZIPs
         foreach (glob($this->plugin_dir . '*.zip') as $zip) unlink($zip);
@@ -414,14 +434,12 @@ update_option('cf_static_remember_pages', $remember_pages);
 // Always deploy using submitted credentials
 // Persistence decision happens AFTER deploy
 
-
 // Check Wrangler installation
 exec('wrangler --version', $output, $return_var);
 if ($return_var !== 0) {
     $this->log[] = "Wrangler CLI not found. Please install Wrangler to enable deployment.";
     $this->display_log_and_exit(); // stops execution and shows log
 }
-
 
     $output_dir = $this->plugin_dir . 'static';
     if (!file_exists($output_dir)) {
@@ -454,7 +472,6 @@ if ($return_var !== 0) {
         'api_token'    => ''
     ]);
 }
-
 
     // Show log on page
     add_action('admin_notices', function() use ($message) {
@@ -636,23 +653,29 @@ curl_setopt_array($ch, [
         $zip->close();
     }
 
-    private function generate_404($dir) {
-        $html = '';
-        if (function_exists('get_404_template')) {
-            $template = get_404_template();
-            if ($template) {
-                ob_start();
-                include $template;
-                $html = ob_get_clean();
-            }
+    private function generate_404($dir, $path) {
+
+        $path = '/' . ltrim($path, '/');
+        $url  = rtrim($this->site_url, '/') . $path;
+
+        $this->log[] = "Generating 404.html from: $url";
+
+        $html = $this->fetch_url($url);
+
+        if (!$html) {
+            $this->log[] = "Failed to fetch content for 404 from: $url";
+            return;
         }
 
-        if ($html) {
-            file_put_contents("$dir/404.html", $html);
-            $this->log[] = "404.html generated successfully.";
-        } else {
-            $this->log[] = "Failed to generate 404.html.";
-        }
+        // Make URLs relative (same behavior as crawler)
+        $html = str_replace($this->site_url, '', $html);
+
+        file_put_contents("$dir/404.html", $html);
+
+        // Also crawl assets from this page
+        $this->crawl_assets($html, $dir);
+
+        $this->log[] = "404.html generated successfully from $path.";
     }
 
     private function display_log_and_exit() {
