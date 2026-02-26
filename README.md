@@ -31,7 +31,7 @@ Perfect for private staging WordPress websites that are locked behind Cloudflare
   - Removes admin-specific JavaScript from the final static build
 
 - ❌ **Optional 404.html generation**
-  - Generates a static `404.html` using your theme’s 404 template
+  - Generates a static `404.html` by crawling a user-defined invalid page.
 
 - ☁️ **Cloudflare Pages deployment**
   - Deploy directly via Wrangler CLI
@@ -86,7 +86,7 @@ Either provide **both**, or leave **both empty**.
 1. Open **CF Static Generator** in WordPress admin
 2. (Optional) Enter CF Access credentials
 3. Select plugins whose JS should be included
-4. (Optional) Enable `Generate 404.html`
+4. (Optional) Enable `Generate 404.html`, and define the invalid page to crawl (default will be */example-page)
 5. Click **Generate Static Site**
 
 After generation:
