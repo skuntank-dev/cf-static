@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Cloudflare Access-Friendly Static Page Generator
  * Description: Generate a static version of your WordPress site, bypassing Cloudflare Access via service tokens. If wrangler CLI is installed, you can also push to Pages with your API token.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: skuntank.dev
  * Author URI: https://skuntank.dev
  * Plugin URI: https://github.com/skuntank-dev/cf-static/
@@ -17,6 +17,7 @@ class CFStatic {
     private $option_name = 'cf_static_tokens';
     private $selected_plugins_option = 'cf_static_selected_plugins';
     private $log = [];
+    private $log_title_override = '';
     private $site_url;
     private $cf_cookie = '';
 
@@ -42,6 +43,7 @@ private function get_plugin_version() {
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_post_cf_static_generate', [$this, 'handle_generate']);
         add_action('admin_post_cf_static_deploy', [$this, 'handle_deploy']);
+        add_action('admin_post_cf_static_generate_and_deploy', [$this, 'handle_generate_and_deploy']);
 
     }
 
@@ -287,10 +289,12 @@ if ($wrangler_return !== 0) {
 <?php 
 $last_zip_exists = !empty($last_zip) && file_exists($this->plugin_dir . basename($last_zip));
 $disable_deploy = ($wrangler_return !== 0 || !$last_zip_exists) ? 'disabled' : ''; 
+$disable_gen_deploy = ($wrangler_return !== 0) ? 'disabled' : '';
 ?>
 
 <p>
     <button type="submit" name="action" value="cf_static_deploy" class="button button-primary" <?php echo $disable_deploy; ?>>Deploy to Cloudflare Pages</button>
+    <button type="submit" name="action" value="cf_static_generate_and_deploy" class="button button-secondary" style="margin-left:6px;" <?php echo $disable_gen_deploy; ?>>Generate and Deploy</button>
 </p>
 
             </form>
@@ -311,7 +315,7 @@ $disable_deploy = ($wrangler_return !== 0 || !$last_zip_exists) ? 'disabled' : '
         <?php
     }
 
-    public function handle_generate() {
+    public function handle_generate($chain_to_deploy = false) {
         if (!current_user_can('manage_options')) wp_die('Unauthorized');
         if (!wp_verify_nonce($_POST['cf_static_nonce'], 'cf_static_generate_nonce')) wp_die('Nonce failed');
 
@@ -415,6 +419,14 @@ if ($remember_cf) {
 
         update_option('cf_static_last_zip', $this->plugin_url . $zip_name);
 
+        if ($chain_to_deploy) {
+            // Caller will continue into the deploy step; don't redirect or exit.
+            $this->log[] = 'Static site generated.';
+            $this->log[] = '';
+            $this->log[] = '=== Starting deployment ===';
+            return;
+        }
+
         wp_redirect(admin_url('admin.php?page=cf-static&message=Static+site+generated'));
         exit;
     }
@@ -460,8 +472,9 @@ if ($return_var !== 0) {
     exec("npx wrangler pages deploy $dir --project-name=$project --branch=$branch 2>&1", $deploy_output, $return_code);
 
     foreach ($deploy_output as $line) $this->log[] = $line;
+    $this->log[] = "Wrangler exit code: $return_code";
+    $this->log[] = $return_code === 0 ? 'Deployment completed successfully!' : 'Deployment failed. Check logs above.';
 
-    $message = $return_code === 0 ? 'Deployment completed successfully!' : 'Deployment failed. Check logs below.';
     if ($remember_pages) {
     update_option('cf_static_pages_options', $cf_pages_options);
 } else {
@@ -473,13 +486,17 @@ if ($return_var !== 0) {
     ]);
 }
 
-    // Show log on page
-    add_action('admin_notices', function() use ($message) {
-        echo '<div class="notice notice-success"><p>' . esc_html($message) . '</p></div>';
-    });
-
-    $this->display_log_and_exit();
+    $this->display_log_and_exit('Deployment Log');
 }
+
+    public function handle_generate_and_deploy() {
+        $this->log_title_override = 'Generate & Deploy Log';
+        // Step 1: generate without redirecting (chain mode). Nonce is checked inside handle_generate.
+        $this->handle_generate(true);
+        // Step 2: continue into deploy. handle_deploy ends with display_log_and_exit(),
+        // which will include all log entries accumulated above.
+        $this->handle_deploy();
+    }
 
     private function crawl_assets($html, $output_dir) {
         preg_match_all('/(src|href)=["\']([^"\']+)["\']/i', $html, $assets);
@@ -678,10 +695,108 @@ curl_setopt_array($ch, [
         $this->log[] = "404.html generated successfully from $path.";
     }
 
-    private function display_log_and_exit() {
-        echo '<ul>';
-        foreach ($this->log as $l) echo '<li>' . esc_html($l) . '</li>';
-        echo '</ul>';
+    private function display_log_and_exit($title = 'Log') {
+        if (!empty($this->log_title_override)) {
+            $title = $this->log_title_override;
+        }
+        // Render the log inside the standard WP admin chrome so it appears
+        // on the same page (no blank plaintext dump).
+        if (!function_exists('require_wp_admin_header')) {
+            require_once ABSPATH . 'wp-admin/admin-header.php';
+        }
+        ?>
+        <div class="wrap">
+            <h1>Cloudflare Access-Friendly Static Page Generator</h1>
+            <div class="cf-static-log-panel">
+                <div class="cf-static-log-header">
+                    <span class="cf-static-log-title"><?php echo esc_html($title); ?></span>
+                    <button type="button" class="button button-small cf-static-log-copy" onclick="cfStaticCopyLog(this)">Copy</button>
+                </div>
+                <pre class="cf-static-log-body" id="cf-static-log-body"><?php
+                    foreach ($this->log as $line) {
+                        $s = (string)$line;
+                        $cls = '';
+                        if (preg_match('/(error|fail|failed|unauthorized|denied|EACCES)/i', $s)) {
+                            $cls = 'cf-static-log-line-error';
+                        } elseif (preg_match('/(success|completed|deployed|generated)/i', $s)) {
+                            $cls = 'cf-static-log-line-success';
+                        } elseif (preg_match('/^(running|fetching|crawl|generating|copying|zipping|removing|using)/i', trim($s))) {
+                            $cls = 'cf-static-log-line-info';
+                        }
+                        echo '<span class="cf-static-log-line ' . esc_attr($cls) . '">' . esc_html($s) . "</span>\n";
+                    }
+                ?></pre>
+            </div>
+            <p style="margin-top:14px;">
+                <a href="<?php echo esc_url(admin_url('admin.php?page=cf-static')); ?>" class="button button-primary">← Back to CF Static Generator</a>
+            </p>
+        </div>
+        <style>
+            .cf-static-log-panel {
+                margin-top: 16px;
+                border: 1px solid #c3c4c7;
+                border-radius: 4px;
+                background: #1e1e1e;
+                overflow: hidden;
+                max-width: 1000px;
+            }
+            .cf-static-log-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 12px;
+                background: #2c2c2c;
+                border-bottom: 1px solid #3a3a3a;
+            }
+            .cf-static-log-title {
+                color: #e0e0e0;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            .cf-static-log-copy { margin-left: auto !important; }
+            .cf-static-log-body {
+                margin: 0;
+                padding: 12px 14px;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                font-family: Menlo, Consolas, "Courier New", monospace;
+                font-size: 12px;
+                line-height: 1.5;
+                max-height: 520px;
+                overflow: auto;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+            .cf-static-log-line { display: block; }
+            .cf-static-log-line-error   { color: #f48771; }
+            .cf-static-log-line-success { color: #6ad36a; }
+            .cf-static-log-line-info    { color: #6fb3d2; }
+        </style>
+        <script>
+            function cfStaticCopyLog(btn) {
+                var body = document.getElementById('cf-static-log-body');
+                if (!body) return;
+                var text = body.innerText;
+                var done = function(){
+                    var orig = btn.innerText;
+                    btn.innerText = 'Copied!';
+                    setTimeout(function(){ btn.innerText = orig; }, 1500);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(done);
+                } else {
+                    var ta = document.createElement('textarea');
+                    ta.value = text;
+                    document.body.appendChild(ta);
+                    ta.select();
+                    try { document.execCommand('copy'); } catch(e){}
+                    document.body.removeChild(ta);
+                    done();
+                }
+            }
+        </script>
+        <?php
+        require_once ABSPATH . 'wp-admin/admin-footer.php';
         exit;
     }
 }
