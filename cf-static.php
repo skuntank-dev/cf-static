@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Cloudflare Access-Friendly Static Page Generator
  * Description: Generate a static version of your WordPress site, bypassing Cloudflare Access via service tokens. If wrangler CLI is installed, you can also push to Pages with your API token.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: skuntank.dev
  * Author URI: https://skuntank.dev
  * Plugin URI: https://github.com/skuntank-dev/cf-static/
@@ -16,6 +16,8 @@ class CFStatic {
 
     private $option_name = 'cf_static_tokens';
     private $selected_plugins_option = 'cf_static_selected_plugins';
+    private $schedule_option = 'cf_static_schedule';
+    private $cron_hook = 'cf_static_scheduled_run';
     private $log = [];
     private $log_title_override = '';
     private $site_url;
@@ -24,6 +26,8 @@ class CFStatic {
     private $plugin_dir;
     private $plugin_url;
     private $last_zip_url = '';
+    private $cron_mode = false;
+    private $cache_bust = ''; // unique per generation run, appended to fetch URLs
 
 private function get_plugin_version() {
     if (!function_exists('get_file_data')) {
@@ -44,6 +48,8 @@ private function get_plugin_version() {
         add_action('admin_post_cf_static_generate', [$this, 'handle_generate']);
         add_action('admin_post_cf_static_deploy', [$this, 'handle_deploy']);
         add_action('admin_post_cf_static_generate_and_deploy', [$this, 'handle_generate_and_deploy']);
+        add_action('admin_post_cf_static_save_schedule', [$this, 'handle_save_schedule']);
+        add_action($this->cron_hook, [$this, 'run_scheduled_task']);
 
     }
 
@@ -299,6 +305,126 @@ $disable_gen_deploy = ($wrangler_return !== 0) ? 'disabled' : '';
 
             </form>
 
+<?php
+$schedule = $this->get_schedule();
+$next_run_ts = wp_next_scheduled($this->cron_hook);
+$tz = wp_timezone();
+$now_ts = time();
+?>
+
+<h2>Automatic Generation &amp; Deployment</h2>
+<p class="description" style="margin-top:-6px;">
+    Schedules generation and/or deployment via WP-Cron using the settings saved above.
+    Toggling this ON or OFF saves the schedule settings immediately.
+</p>
+
+<form method="post" action="<?php echo admin_url('admin-post.php'); ?>" id="cf-static-schedule-form">
+    <input type="hidden" name="action" value="cf_static_save_schedule">
+    <?php wp_nonce_field('cf_static_schedule_nonce', 'cf_static_schedule_nonce'); ?>
+    <input type="hidden" name="schedule_enabled" id="cf_schedule_enabled_hidden" value="<?php echo !empty($schedule['enabled']) ? '1' : '0'; ?>">
+
+    <table class="form-table">
+        <tr>
+            <th>Status</th>
+            <td>
+                <span id="cf_schedule_status_label" style="font-weight:600; color:<?php echo !empty($schedule['enabled']) ? '#1a7f37' : '#777'; ?>;">
+                    <?php echo !empty($schedule['enabled']) ? 'ENABLED' : 'DISABLED'; ?>
+                </span>
+                <?php if (!empty($schedule['enabled']) && $next_run_ts): ?>
+                    <span style="margin-left:12px; color:#555;">
+                        Next run: <?php echo esc_html(wp_date('Y-m-d H:i:s', $next_run_ts)); ?>
+                        (<?php echo esc_html(human_time_diff($now_ts, $next_run_ts)); ?>
+                        <?php echo $next_run_ts > $now_ts ? 'from now' : 'ago'; ?>)
+                    </span>
+                <?php endif; ?>
+            </td>
+        </tr>
+        <tr>
+            <th>Action</th>
+            <td>
+                <label style="display:block; margin-bottom:4px;">
+                    <input type="radio" name="schedule_mode" value="generate" <?php checked($schedule['mode'], 'generate'); ?>>
+                    Generate static site only
+                </label>
+                <label style="display:block; margin-bottom:4px;">
+                    <input type="radio" name="schedule_mode" value="deploy" <?php checked($schedule['mode'], 'deploy'); ?>>
+                    Deploy existing static site only
+                </label>
+                <label style="display:block;">
+                    <input type="radio" name="schedule_mode" value="generate_and_deploy" <?php checked($schedule['mode'], 'generate_and_deploy'); ?>>
+                    Generate and deploy
+                </label>
+            </td>
+        </tr>
+        <tr>
+            <th>Schedule</th>
+            <td>
+                <label style="display:block; margin-bottom:6px;">
+                    <input type="radio" name="schedule_type" value="interval" class="cf-schedule-type" <?php checked($schedule['schedule_type'], 'interval'); ?>>
+                    Run every
+                    <input type="number" name="interval_hours" min="0" max="999"
+                           value="<?php echo esc_attr($schedule['interval_hours']); ?>" style="width:70px;"> hours
+                    <input type="number" name="interval_minutes" min="0" max="59"
+                           value="<?php echo esc_attr($schedule['interval_minutes']); ?>" style="width:70px;"> minutes
+                </label>
+                <label style="display:block;">
+                    <input type="radio" name="schedule_type" value="daily" class="cf-schedule-type" <?php checked($schedule['schedule_type'], 'daily'); ?>>
+                    Daily at
+                    <input type="time" name="daily_time"
+                           value="<?php echo esc_attr($schedule['daily_time']); ?>" step="60">
+                    <span class="description">(site timezone: <?php echo esc_html(wp_timezone_string()); ?>)</span>
+                </label>
+            </td>
+        </tr>
+        <tr>
+            <th>Last automatic run</th>
+            <td>
+                <?php if (!empty($schedule['last_run'])): ?>
+                    <?php echo esc_html(wp_date('Y-m-d H:i:s', (int)$schedule['last_run'])); ?>
+                    (<?php echo esc_html(human_time_diff((int)$schedule['last_run'], $now_ts)); ?> ago)
+                    <?php if (!empty($schedule['last_status'])): ?>
+                        — <em><?php echo esc_html($schedule['last_status']); ?></em>
+                    <?php endif; ?>
+                <?php else: ?>
+                    <em>Never</em>
+                <?php endif; ?>
+            </td>
+        </tr>
+    </table>
+
+    <p>
+        <button type="submit" id="cf_schedule_toggle_btn"
+                class="button <?php echo !empty($schedule['enabled']) ? 'button-secondary' : 'button-primary'; ?>"
+                data-on-label="Turn Auto Generate/Deploy OFF"
+                data-off-label="Turn Auto Generate/Deploy ON">
+            <?php echo !empty($schedule['enabled']) ? 'Turn Auto Generate/Deploy OFF' : 'Turn Auto Generate/Deploy ON'; ?>
+        </button>
+        <button type="submit" id="cf_schedule_save_btn" class="button button-secondary" style="margin-left:6px;">
+            Save Schedule Settings
+        </button>
+    </p>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        var hidden    = document.getElementById('cf_schedule_enabled_hidden');
+        var toggleBtn = document.getElementById('cf_schedule_toggle_btn');
+        var saveBtn   = document.getElementById('cf_schedule_save_btn');
+
+        // Toggle button flips the hidden enabled flag, then submits.
+        toggleBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            hidden.value = (hidden.value === '1') ? '0' : '1';
+            toggleBtn.form.submit();
+        });
+
+        // "Save Schedule Settings" keeps enabled state as-is and just saves.
+        saveBtn.addEventListener('click', function(e) {
+            // Default form submission — hidden value already reflects current state.
+        });
+    });
+    </script>
+</form>
+
             <?php if (!empty($this->log)): ?>
                 <h2>Log</h2>
                 <ul>
@@ -316,42 +442,64 @@ $disable_gen_deploy = ($wrangler_return !== 0) ? 'disabled' : '';
     }
 
     public function handle_generate($chain_to_deploy = false) {
-        if (!current_user_can('manage_options')) wp_die('Unauthorized');
-        if (!wp_verify_nonce($_POST['cf_static_nonce'], 'cf_static_generate_nonce')) wp_die('Nonce failed');
-
-        $client_id     = sanitize_text_field($_POST['client_id']);
-        $client_secret = sanitize_text_field($_POST['client_secret']);
-        $remember_cf = !empty($_POST['remember_cf']);
-        update_option('cf_static_remember_cf', $remember_cf);
-
-        $generate_404  = !empty($_POST['generate_404']);
-        update_option('cf_static_generate_404', $generate_404);
-        $generate_404_path = sanitize_text_field($_POST['generate_404_path'] ?? '');
-
-        if (empty($generate_404_path)) {
-            $generate_404_path = 'example-page';
+        if (!$this->cron_mode) {
+            if (!current_user_can('manage_options')) wp_die('Unauthorized');
+            if (!wp_verify_nonce($_POST['cf_static_nonce'], 'cf_static_generate_nonce')) wp_die('Nonce failed');
         }
 
-        update_option('cf_static_generate_404_path', $generate_404_path);
+        if ($this->cron_mode) {
+            // Pull all inputs from previously saved options.
+            $saved_tokens     = get_option($this->option_name, ['client_id' => '', 'client_secret' => '']);
+            $client_id        = $saved_tokens['client_id'] ?? '';
+            $client_secret    = $saved_tokens['client_secret'] ?? '';
+            $generate_404     = (bool) get_option('cf_static_generate_404', false);
+            $generate_404_path = get_option('cf_static_generate_404_path', 'example-page');
+            if (empty($generate_404_path)) $generate_404_path = 'example-page';
+            $selected_plugins = get_option($this->selected_plugins_option, []);
+            if (!is_array($selected_plugins)) $selected_plugins = [];
+        } else {
+            $client_id     = sanitize_text_field($_POST['client_id']);
+            $client_secret = sanitize_text_field($_POST['client_secret']);
+            $remember_cf = !empty($_POST['remember_cf']);
+            update_option('cf_static_remember_cf', $remember_cf);
 
-        $selected_plugins = !empty($_POST['selected_plugins']) ? array_map('sanitize_text_field', $_POST['selected_plugins']) : [];
+            $generate_404  = !empty($_POST['generate_404']);
+            update_option('cf_static_generate_404', $generate_404);
+            $generate_404_path = sanitize_text_field($_POST['generate_404_path'] ?? '');
 
-if ($remember_cf) {
-    update_option($this->option_name, compact('client_id', 'client_secret'));
-} else {
-    update_option($this->option_name, ['client_id' => '', 'client_secret' => '']);
-}
+            if (empty($generate_404_path)) {
+                $generate_404_path = 'example-page';
+            }
 
-        update_option($this->selected_plugins_option, $selected_plugins);
+            update_option('cf_static_generate_404_path', $generate_404_path);
+
+            $selected_plugins = !empty($_POST['selected_plugins']) ? array_map('sanitize_text_field', $_POST['selected_plugins']) : [];
+
+            if ($remember_cf) {
+                update_option($this->option_name, compact('client_id', 'client_secret'));
+            } else {
+                update_option($this->option_name, ['client_id' => '', 'client_secret' => '']);
+            }
+
+            update_option($this->selected_plugins_option, $selected_plugins);
+        }
 
         $output_dir = $this->plugin_dir . 'static';
         if (!file_exists($output_dir)) mkdir($output_dir, 0755, true);
+
+        // Unique token for this generation run, appended to every fetched URL so
+        // no cache layer (origin, Cloudflare edge, intermediate proxy) can serve
+        // a stale copy. It never touches the saved filename — only the request.
+        $this->cache_bust = 'cfsb' . time() . bin2hex(random_bytes(4));
 
         // Only authenticate with Cloudflare Access if BOTH fields are provided
         if (!empty($client_id) && !empty($client_secret)) {
             $this->cf_cookie = $this->authenticate_cf($client_id, $client_secret);
             if (!$this->cf_cookie) {
                 $this->log[] = 'Cloudflare authentication failed';
+                if ($this->cron_mode) {
+                    throw new \RuntimeException('Cloudflare authentication failed');
+                }
                 $this->display_log_and_exit();
             }
         } else {
@@ -427,21 +575,49 @@ if ($remember_cf) {
             return;
         }
 
+        if ($this->cron_mode) {
+            $this->log[] = 'Static site generated.';
+            return;
+        }
+
         wp_redirect(admin_url('admin.php?page=cf-static&message=Static+site+generated'));
         exit;
     }
 public function handle_deploy() {
-    if (!current_user_can('manage_options')) wp_die('Unauthorized');
-    
-    // Save/update Wrangler config
-    $cf_pages_options = [
-        'project_name' => sanitize_text_field($_POST['cf_pages_project_name'] ?? ''),
-        'branch'       => sanitize_text_field($_POST['cf_pages_branch'] ?? 'main'),
-        'account_id'   => sanitize_text_field($_POST['cf_pages_account_id'] ?? ''),
-        'api_token'    => sanitize_text_field($_POST['cf_pages_api_token'] ?? ''),
-    ];
-$remember_pages = !empty($_POST['remember_pages']);
-update_option('cf_static_remember_pages', $remember_pages);
+    if (!$this->cron_mode) {
+        if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    }
+
+    if ($this->cron_mode) {
+        // Cron path: use saved credentials only.
+        $saved = get_option('cf_static_pages_options', [
+            'project_name' => '',
+            'branch'       => 'main',
+            'account_id'   => '',
+            'api_token'    => ''
+        ]);
+        $cf_pages_options = [
+            'project_name' => $saved['project_name'] ?? '',
+            'branch'       => $saved['branch'] ?? 'main',
+            'account_id'   => $saved['account_id'] ?? '',
+            'api_token'    => $saved['api_token'] ?? '',
+        ];
+        if (empty($cf_pages_options['account_id']) || empty($cf_pages_options['api_token'])) {
+            $this->log[] = 'Scheduled deploy: Account ID / API Token not saved. Enable "Remember Account ID and API Token" to use scheduled deployment.';
+            throw new \RuntimeException('Missing saved Cloudflare Pages credentials');
+        }
+        $remember_pages = true; // cron path uses saved creds only
+    } else {
+        // Save/update Wrangler config
+        $cf_pages_options = [
+            'project_name' => sanitize_text_field($_POST['cf_pages_project_name'] ?? ''),
+            'branch'       => sanitize_text_field($_POST['cf_pages_branch'] ?? 'main'),
+            'account_id'   => sanitize_text_field($_POST['cf_pages_account_id'] ?? ''),
+            'api_token'    => sanitize_text_field($_POST['cf_pages_api_token'] ?? ''),
+        ];
+        $remember_pages = !empty($_POST['remember_pages']);
+        update_option('cf_static_remember_pages', $remember_pages);
+    }
 
 // Always deploy using submitted credentials
 // Persistence decision happens AFTER deploy
@@ -450,11 +626,18 @@ update_option('cf_static_remember_pages', $remember_pages);
 exec('wrangler --version', $output, $return_var);
 if ($return_var !== 0) {
     $this->log[] = "Wrangler CLI not found. Please install Wrangler to enable deployment.";
+    if ($this->cron_mode) {
+        throw new \RuntimeException('Wrangler CLI not found');
+    }
     $this->display_log_and_exit(); // stops execution and shows log
 }
 
     $output_dir = $this->plugin_dir . 'static';
     if (!file_exists($output_dir)) {
+        if ($this->cron_mode) {
+            $this->log[] = 'Static folder not found. Generate site first.';
+            throw new \RuntimeException('Static folder not found');
+        }
         wp_redirect(admin_url('admin.php?page=cf-static&message=' . urlencode('Static folder not found. Generate site first.')));
         exit;
     }
@@ -475,16 +658,25 @@ if ($return_var !== 0) {
     $this->log[] = "Wrangler exit code: $return_code";
     $this->log[] = $return_code === 0 ? 'Deployment completed successfully!' : 'Deployment failed. Check logs above.';
 
-    if ($remember_pages) {
-    update_option('cf_static_pages_options', $cf_pages_options);
-} else {
-    update_option('cf_static_pages_options', [
-        'project_name' => $cf_pages_options['project_name'],
-        'branch'       => $cf_pages_options['branch'],
-        'account_id'   => '',
-        'api_token'    => ''
-    ]);
-}
+    if (!$this->cron_mode) {
+        if ($remember_pages) {
+            update_option('cf_static_pages_options', $cf_pages_options);
+        } else {
+            update_option('cf_static_pages_options', [
+                'project_name' => $cf_pages_options['project_name'],
+                'branch'       => $cf_pages_options['branch'],
+                'account_id'   => '',
+                'api_token'    => ''
+            ]);
+        }
+    }
+
+    if ($this->cron_mode) {
+        if ($return_code !== 0) {
+            throw new \RuntimeException('Deployment failed (exit code ' . $return_code . ')');
+        }
+        return;
+    }
 
     $this->display_log_and_exit('Deployment Log');
 }
@@ -496,6 +688,189 @@ if ($return_var !== 0) {
         // Step 2: continue into deploy. handle_deploy ends with display_log_and_exit(),
         // which will include all log entries accumulated above.
         $this->handle_deploy();
+    }
+
+    /**
+     * Return saved schedule settings merged with defaults.
+     */
+    private function get_schedule() {
+        $defaults = [
+            'enabled'          => false,
+            'mode'             => 'generate_and_deploy',
+            'schedule_type'    => 'interval',
+            'interval_hours'   => 24,
+            'interval_minutes' => 0,
+            'daily_time'       => '03:00',
+            'last_run'         => 0,
+            'last_status'      => '',
+        ];
+        $saved = get_option($this->schedule_option, []);
+        if (!is_array($saved)) $saved = [];
+        return array_merge($defaults, $saved);
+    }
+
+    /**
+     * Compute the next run timestamp (UTC unix) for the given schedule.
+     */
+    private function compute_next_run($schedule) {
+        $now = time();
+
+        if ($schedule['schedule_type'] === 'daily') {
+            $tz = wp_timezone();
+            $time_parts = explode(':', $schedule['daily_time']);
+            $hh = isset($time_parts[0]) ? max(0, min(23, (int)$time_parts[0])) : 3;
+            $mm = isset($time_parts[1]) ? max(0, min(59, (int)$time_parts[1])) : 0;
+
+            $today = new DateTime('now', $tz);
+            $today->setTime($hh, $mm, 0);
+            $next_ts = $today->getTimestamp();
+            if ($next_ts <= $now) {
+                $today->modify('+1 day');
+                $next_ts = $today->getTimestamp();
+            }
+            return $next_ts;
+        }
+
+        // interval
+        $h = (int)$schedule['interval_hours'];
+        $m = (int)$schedule['interval_minutes'];
+        $seconds = ($h * 3600) + ($m * 60);
+        if ($seconds < 60) $seconds = 60; // safety floor: 1 minute
+        return $now + $seconds;
+    }
+
+    /**
+     * Unschedule any pending cf_static_scheduled_run events.
+     */
+    private function unschedule_all() {
+        while ($ts = wp_next_scheduled($this->cron_hook)) {
+            wp_unschedule_event($ts, $this->cron_hook);
+        }
+    }
+
+    /**
+     * Reschedule the next single cron event based on current saved schedule.
+     */
+    private function reschedule_next($schedule = null) {
+        if ($schedule === null) $schedule = $this->get_schedule();
+        $this->unschedule_all();
+        if (!empty($schedule['enabled'])) {
+            $next = $this->compute_next_run($schedule);
+            wp_schedule_single_event($next, $this->cron_hook);
+        }
+    }
+
+    /**
+     * Handle POST from the schedule form. Saves settings and toggles cron.
+     */
+    public function handle_save_schedule() {
+        if (!current_user_can('manage_options')) wp_die('Unauthorized');
+        if (!isset($_POST['cf_static_schedule_nonce']) ||
+            !wp_verify_nonce($_POST['cf_static_schedule_nonce'], 'cf_static_schedule_nonce')) {
+            wp_die('Nonce failed');
+        }
+
+        $current = $this->get_schedule();
+
+        $enabled = !empty($_POST['schedule_enabled']) && $_POST['schedule_enabled'] === '1';
+
+        $mode = sanitize_text_field($_POST['schedule_mode'] ?? 'generate_and_deploy');
+        $allowed_modes = ['generate', 'deploy', 'generate_and_deploy'];
+        if (!in_array($mode, $allowed_modes, true)) $mode = 'generate_and_deploy';
+
+        $schedule_type = sanitize_text_field($_POST['schedule_type'] ?? 'interval');
+        if (!in_array($schedule_type, ['interval', 'daily'], true)) $schedule_type = 'interval';
+
+        $interval_hours   = isset($_POST['interval_hours'])   ? max(0, min(999, (int)$_POST['interval_hours']))   : 24;
+        $interval_minutes = isset($_POST['interval_minutes']) ? max(0, min(59,  (int)$_POST['interval_minutes'])) : 0;
+
+        // For interval, refuse 0/0 — fall back to 24h.
+        if ($schedule_type === 'interval' && $interval_hours === 0 && $interval_minutes === 0) {
+            $interval_hours = 24;
+        }
+
+        $daily_time_raw = sanitize_text_field($_POST['daily_time'] ?? '03:00');
+        if (!preg_match('/^\d{1,2}:\d{2}$/', $daily_time_raw)) {
+            $daily_time_raw = '03:00';
+        }
+        [$dh, $dm] = array_pad(explode(':', $daily_time_raw), 2, '00');
+        $daily_time = sprintf('%02d:%02d', max(0, min(23, (int)$dh)), max(0, min(59, (int)$dm)));
+
+        $new = [
+            'enabled'          => $enabled,
+            'mode'             => $mode,
+            'schedule_type'    => $schedule_type,
+            'interval_hours'   => $interval_hours,
+            'interval_minutes' => $interval_minutes,
+            'daily_time'       => $daily_time,
+            'last_run'         => (int)($current['last_run'] ?? 0),
+            'last_status'      => (string)($current['last_status'] ?? ''),
+        ];
+
+        update_option($this->schedule_option, $new);
+
+        // (Re)schedule or clear the cron event.
+        $this->reschedule_next($new);
+
+        $msg = $enabled
+            ? 'Auto generate/deploy enabled and schedule saved.'
+            : 'Auto generate/deploy disabled and schedule saved.';
+
+        wp_redirect(admin_url('admin.php?page=cf-static&message=' . urlencode($msg)));
+        exit;
+    }
+
+    /**
+     * WP-Cron entrypoint.
+     */
+    public function run_scheduled_task() {
+        $schedule = $this->get_schedule();
+
+        // If disabled, do nothing and ensure no further events are scheduled.
+        if (empty($schedule['enabled'])) {
+            $this->unschedule_all();
+            return;
+        }
+
+        $this->cron_mode = true;
+        $this->log_title_override = 'Scheduled Run Log';
+        $status = 'success';
+
+        try {
+            switch ($schedule['mode']) {
+                case 'generate':
+                    $this->handle_generate(false);
+                    $status = 'generate: success';
+                    break;
+                case 'deploy':
+                    $this->handle_deploy();
+                    $status = 'deploy: success';
+                    break;
+                case 'generate_and_deploy':
+                default:
+                    $this->handle_generate(true);
+                    $this->handle_deploy();
+                    $status = 'generate+deploy: success';
+                    break;
+            }
+        } catch (\Throwable $e) {
+            $status = 'failed: ' . $e->getMessage();
+            error_log('[cf-static scheduled run] ' . $e->getMessage());
+            if (!empty($this->log)) {
+                error_log('[cf-static scheduled run] log: ' . implode(' | ', array_slice($this->log, -10)));
+            }
+        }
+
+        // Update last_run + last_status. Re-read fresh in case the user changed
+        // settings during the run, and only overwrite the bookkeeping fields so
+        // we don't clobber the user's latest choices.
+        $schedule_now = $this->get_schedule();
+        $schedule_now['last_run']    = time();
+        $schedule_now['last_status'] = $status;
+        update_option($this->schedule_option, $schedule_now);
+
+        $this->cron_mode = false;
+        $this->reschedule_next($schedule_now);
     }
 
     private function crawl_assets($html, $output_dir) {
@@ -510,7 +885,19 @@ if ($return_var !== 0) {
         }
 
         foreach ($urls as $asset) {
-            $asset_trim = ltrim($asset, '/');
+            // Strip query string and fragment before using the URL for
+            // filesystem paths. Cache-busters like "?t=12345" or "?ver=6.4"
+            // produce invalid/awkward filenames (and the static host serves
+            // the same file regardless of those params anyway).
+            $asset_clean = strtok($asset, '?');
+            if ($asset_clean === false) $asset_clean = $asset;
+            $hash_pos = strpos($asset_clean, '#');
+            if ($hash_pos !== false) {
+                $asset_clean = substr($asset_clean, 0, $hash_pos);
+            }
+            if ($asset_clean === '') continue;
+
+            $asset_trim = ltrim($asset_clean, '/');
 
             if (preg_match('#^(cdn-cgi|comments|feed|wp-json)/#', $asset_trim) || 
                 preg_match('#^xmlrpc\.php$#', $asset_trim)) {
@@ -641,17 +1028,34 @@ if ($return_var !== 0) {
     }
 
     private function fetch_url($url) {
-        $ch = curl_init($url);
-$headers = [];
-if (!empty($this->cf_cookie)) {
-    $headers[] = "Cookie: {$this->cf_cookie}";
-}
+        // Append a unique cache-busting param to the request URL so no cache
+        // layer can return a stale copy. This affects ONLY the request — callers
+        // compute filenames from the original (cleaned) URL, never from this.
+        $fetch_url = $url;
+        if (!empty($this->cache_bust)) {
+            $sep = (strpos($fetch_url, '?') !== false) ? '&' : '?';
+            $fetch_url .= $sep . $this->cache_bust . '=1';
+        }
 
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_FOLLOWLOCATION => true,
-    CURLOPT_HTTPHEADER     => $headers
-]);
+        $ch = curl_init($fetch_url);
+
+        // Force every request to bypass caches (browser-style cache directives
+        // plus a unique query param) so we always pull the freshest asset/page.
+        $headers = [
+            'Cache-Control: no-cache, no-store, max-age=0',
+            'Pragma: no-cache',
+        ];
+        if (!empty($this->cf_cookie)) {
+            $headers[] = "Cookie: {$this->cf_cookie}";
+        }
+
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_FRESH_CONNECT  => true, // don't reuse a cached connection
+            CURLOPT_FORBID_REUSE   => true,
+            CURLOPT_HTTPHEADER     => $headers,
+        ]);
 
         return curl_exec($ch);
     }
@@ -802,3 +1206,10 @@ curl_setopt_array($ch, [
 }
 
 new CFStatic();
+
+// Clear scheduled cron events when the plugin is deactivated.
+register_deactivation_hook(__FILE__, function () {
+    while ($ts = wp_next_scheduled('cf_static_scheduled_run')) {
+        wp_unschedule_event($ts, 'cf_static_scheduled_run');
+    }
+});
