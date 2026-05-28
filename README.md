@@ -109,6 +109,8 @@ After generation:
 
 Credentials can be optionally remembered (not recommended on shared servers).
 
+**Since v1.3.0: Now with automatic generation + deployment that runs on a schedule via WP-Cron**
+
 ---
 
 ## Security Notes
