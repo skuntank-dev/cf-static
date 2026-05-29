@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Cloudflare Access-Friendly Static Page Generator
  * Description: Generate a static version of your WordPress site, bypassing Cloudflare Access via service tokens. If wrangler CLI is installed, you can also push to Pages with your API token.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: skuntank.dev
  * Author URI: https://skuntank.dev
  * Plugin URI: https://github.com/skuntank-dev/cf-static/
@@ -457,6 +457,19 @@ $now_ts = time();
             if (empty($generate_404_path)) $generate_404_path = 'example-page';
             $selected_plugins = get_option($this->selected_plugins_option, []);
             if (!is_array($selected_plugins)) $selected_plugins = [];
+
+            // Resolve the site URL without depending on request context.
+            // Under WP-Cron/CLI, get_site_url() can return a wrong/empty host
+            // because dynamic setups derive it from $_SERVER. The raw 'siteurl'
+            // option is the canonical stored value and isn't request-dependent.
+            // Order: URL captured by a manual run (if any) > raw DB option > get_site_url().
+            $resolved_site_url = get_option('cf_static_effective_site_url', '');
+            if (empty($resolved_site_url)) {
+                $resolved_site_url = get_option('siteurl', '');
+            }
+            if (!empty($resolved_site_url)) {
+                $this->site_url = $resolved_site_url;
+            }
         } else {
             $client_id     = sanitize_text_field($_POST['client_id']);
             $client_secret = sanitize_text_field($_POST['client_secret']);
@@ -482,6 +495,10 @@ $now_ts = time();
             }
 
             update_option($this->selected_plugins_option, $selected_plugins);
+
+            // Remember the URL this (working) manual run used, so the scheduled
+            // run can reuse it verbatim instead of relying on get_site_url().
+            update_option('cf_static_effective_site_url', $this->site_url);
         }
 
         $output_dir = $this->plugin_dir . 'static';
@@ -1007,22 +1024,46 @@ if ($return_var !== 0) {
     }
 
     private function authenticate_cf($id, $secret) {
+        $cookie = $this->cf_auth_request($id, $secret, false);
+        if ($cookie === false) {
+            // Retry once forcing a known CA bundle. The CLI php.ini used by
+            // WP-Cron sometimes lacks a valid curl.cainfo while the web SAPI
+            // has one, so the HTTPS handshake fails only on the scheduled run.
+            $cookie = $this->cf_auth_request($id, $secret, true);
+        }
+        return $cookie;
+    }
+
+    private function cf_auth_request($id, $secret, $force_ca) {
         $ch = curl_init($this->site_url);
-        curl_setopt_array($ch, [
+        $opts = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HEADER         => true,
             CURLOPT_NOBODY         => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT        => 20,
             CURLOPT_HTTPHEADER     => [
                 "CF-Access-Client-Id: $id",
                 "CF-Access-Client-Secret: $secret"
             ]
-        ]);
+        ];
+        if ($force_ca) {
+            foreach (['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'] as $ca) {
+                if (file_exists($ca)) { $opts[CURLOPT_CAINFO] = $ca; break; }
+            }
+        }
+        curl_setopt_array($ch, $opts);
 
-        $res = curl_exec($ch);
+        $res   = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = curl_error($ch);
         curl_close($ch);
 
-        if (preg_match('/CF_Authorization=([^;]+)/', $res, $m)) {
+        if ($res !== false && preg_match('/CF_Authorization=([^;]+)/', $res, $m)) {
             return "CF_Authorization={$m[1]}";
+        }
+        if ($errno) {
+            $this->log[] = "CF auth curl error ($errno): $error (target {$this->site_url})";
         }
         return false;
     }
