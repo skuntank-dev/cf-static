@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Cloudflare Access-Friendly Static Page Generator
  * Description: Generate a static version of your WordPress site, bypassing Cloudflare Access via service tokens. If wrangler CLI is installed, you can also push to Pages with your API token.
- * Version: 1.3.1
+ * Version: 1.3.2
  * Author: skuntank.dev
  * Author URI: https://skuntank.dev
  * Plugin URI: https://github.com/skuntank-dev/cf-static/
@@ -28,6 +28,7 @@ class CFStatic {
     private $last_zip_url = '';
     private $cron_mode = false;
     private $cache_bust = ''; // unique per generation run, appended to fetch URLs
+    private $fetched_assets = []; // assets already pulled THIS run (dedup, reset per run)
 
 private function get_plugin_version() {
     if (!function_exists('get_file_data')) {
@@ -502,7 +503,13 @@ $now_ts = time();
         }
 
         $output_dir = $this->plugin_dir . 'static';
-        if (!file_exists($output_dir)) mkdir($output_dir, 0755, true);
+        // Start every run from a clean slate. The output dir is persistent
+        // across runs, so without wiping it, assets written by a previous run
+        // linger and shadow updated files (an edited schedule.png would never
+        // overwrite the stale copy). Reset the per-run fetch tracker too.
+        if (file_exists($output_dir)) $this->rrmdir($output_dir);
+        mkdir($output_dir, 0755, true);
+        $this->fetched_assets = [];
 
         // Unique token for this generation run, appended to every fetched URL so
         // no cache layer (origin, Cloudflare edge, intermediate proxy) can serve
@@ -925,11 +932,18 @@ if ($return_var !== 0) {
                 $src = rtrim($this->site_url, '/') . '/' . $asset_trim;
                 $dst = $output_dir . '/' . $asset_trim;
 
+                // Only skip if we already pulled this exact asset earlier in the
+                // SAME run (a page may reference it many times). We deliberately
+                // do NOT skip on file_exists($dst): that check used to make a
+                // stale copy from a prior run permanent, since the asset would
+                // never be re-fetched once written. The static dir is wiped at
+                // the start of each run, so a fresh copy is pulled every time.
+                if (isset($this->fetched_assets[$asset_trim])) continue;
+                $this->fetched_assets[$asset_trim] = true;
+
                 if (!file_exists(dirname($dst))) mkdir(dirname($dst), 0755, true);
-                if (!file_exists($dst)) {
-                    $data = $this->fetch_url($src);
-                    if ($data) file_put_contents($dst, $data);
-                }
+                $data = $this->fetch_url($src);
+                if ($data !== false && $data !== '') file_put_contents($dst, $data);
             }
         }
     }
@@ -1005,6 +1019,27 @@ if ($return_var !== 0) {
             }
         }
         closedir($dir);
+    }
+
+    // Recursively delete a directory and all its contents. Used to wipe the
+    // static output dir before each generation run so no stale assets survive.
+    private function rrmdir($dir) {
+        if (!is_dir($dir)) {
+            if (file_exists($dir)) @unlink($dir);
+            return;
+        }
+        $items = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($items as $item) {
+            if ($item->isDir()) {
+                @rmdir($item->getPathname());
+            } else {
+                @unlink($item->getPathname());
+            }
+        }
+        @rmdir($dir);
     }
 
     private function sanitize_admin_js($dir) {
